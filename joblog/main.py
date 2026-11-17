@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Path as PathParam
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -41,6 +42,57 @@ class LogEntry(BaseModel):
 class LogList(BaseModel):
     items: list[LogEntry]
     next_after_id: int | None
+
+
+# Collector batch ingestion (采集器批量上报).  Sequence numbers start at 1 and
+# increase by 1 per entry; batches may overlap already-stored entries as long
+# as the overlapping content is identical (idempotent retry after a timeout).
+COLLECTOR_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+
+
+class BatchLogEntry(BaseModel):
+    seq: int = Field(ge=1, description="Sequence number, 1-based, gapless per collector")
+    job_id: str = Field(min_length=1, max_length=200)
+    message: str = Field(max_length=100_000)
+
+
+class CollectorBatch(BaseModel):
+    entries: list[BatchLogEntry] = Field(min_length=1, max_length=1000)
+
+
+class BatchEntryResult(BaseModel):
+    seq: int
+    log_id: int
+    status: Literal["appended", "duplicate"]
+
+
+class CollectorBatchReceipt(BaseModel):
+    collector: str
+    results: list[BatchEntryResult]
+    appended: int
+    duplicated: int
+    next_seq: int = Field(description="Sequence number the next entry must use")
+
+
+class CollectorProgress(BaseModel):
+    collector: str
+    next_seq: int
+    stored: int
+    updated_at: str
+
+
+class CollectorLogItem(BaseModel):
+    seq: int
+    log_id: int
+    job_id: str
+    message: str
+    created_at: str
+
+
+class CollectorLogList(BaseModel):
+    collector: str
+    items: list[CollectorLogItem]
+    next_after_seq: int | None
 
 
 class BackupView(BaseModel):
@@ -142,12 +194,17 @@ def create_app(
 
     app = FastAPI(
         title="Job Log Service",
-        version="1.0.0",
+        version="1.1.0",
         description=(
-            "Append-only job logs with consistent, immutable backups and verified restore.\n\n"
-            "Backups are published only after the snapshot and its SHA-256 manifest have "
-            "been verified. Restores target an independent database file and leave the "
-            "source database writable."
+            "Append-only job logs with idempotent per-collector batch ingestion, "
+            "consistent immutable backups and verified restore.\n\n"
+            "Collectors submit sequenced batches that are safe to retry after "
+            "timeouts: overlapping entries are matched by content and only the "
+            "new tail is appended; gaps or changed history reject the whole "
+            "batch. Backups are published only after the snapshot and its "
+            "SHA-256 manifest have been verified, and capture collector "
+            "progress together with the logs in the same snapshot. Restores "
+            "target an independent database file and leave the source writable."
         ),
         lifespan=lifespan,
     )
@@ -207,6 +264,209 @@ def create_app(
             rows = conn.execute(sql, params).fetchall()
         items = [LogEntry(**dict(r)) for r in rows]
         return LogList(items=items, next_after_id=items[-1].id if items else None)
+
+    # ---------------------------------------------------- collector batches
+    def _collector_not_found(collector: str) -> HTTPException:
+        return HTTPException(
+            status_code=404, detail=f"collector {collector!r} has not submitted any batch"
+        )
+
+    @app.post(
+        "/collectors/{collector}/logs/batch",
+        response_model=CollectorBatchReceipt,
+        tags=["collectors"],
+        summary="Receive a sequenced batch of logs from one collector (idempotent)",
+        description=(
+            "Entries carry per-collector sequence numbers starting at 1. "
+            "A batch may overlap already-stored entries: identical entries are "
+            "acknowledged with their original log id and only the contiguous new "
+            "tail is appended, so a timeout retry is safe. If the batch skips a "
+            "sequence number or an old sequence number arrives with different "
+            "content, the whole batch is rejected with 409 and neither logs nor "
+            "collector progress change. Concurrent batches and retries after a "
+            "restart observe the same stored state."
+        ),
+    )
+    def submit_collector_batch(
+        batch: CollectorBatch,
+        collector: str = PathParam(pattern=COLLECTOR_ID_PATTERN),
+    ) -> CollectorBatchReceipt:
+        entries = batch.entries
+        # The whole check-and-append runs in one BEGIN IMMEDIATE transaction:
+        # concurrent batches serialise on the write lock, and any rejection
+        # rolls back so logs and progress are untouched.
+        with database.writer() as conn:
+            row = conn.execute(
+                "SELECT next_seq FROM collector_states WHERE collector = ?",
+                (collector,),
+            ).fetchone()
+            next_seq = int(row["next_seq"]) if row is not None else 1
+
+            # Sequence numbers must be contiguous and ascending within the batch.
+            first_seq = entries[0].seq
+            for offset, entry in enumerate(entries):
+                if entry.seq != first_seq + offset:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "sequence_gap",
+                            "expected_seq": first_seq + offset,
+                            "received_seq": entry.seq,
+                            "message": (
+                                "entries within a batch must have contiguous, "
+                                "ascending sequence numbers; batch rejected"
+                            ),
+                        },
+                    )
+
+            results: list[BatchEntryResult] = []
+            for entry in entries:
+                if entry.seq < next_seq:
+                    # Overlap with stored history: acknowledge only if the
+                    # content is byte-identical to what was first accepted.
+                    stored = conn.execute(
+                        "SELECT log_id, job_id, message FROM collector_logs"
+                        " WHERE collector = ? AND seq = ?",
+                        (collector, entry.seq),
+                    ).fetchone()
+                    if stored is None:  # contiguity invariant violated
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"collector {collector!r} state is inconsistent",
+                        )
+                    if (
+                        stored["job_id"] != entry.job_id
+                        or stored["message"] != entry.message
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error": "content_mismatch",
+                                "seq": entry.seq,
+                                "log_id": int(stored["log_id"]),
+                                "message": (
+                                    "sequence already stored with different "
+                                    "content; whole batch rejected, logs and "
+                                    "progress unchanged"
+                                ),
+                            },
+                        )
+                    results.append(
+                        BatchEntryResult(
+                            seq=entry.seq,
+                            log_id=int(stored["log_id"]),
+                            status="duplicate",
+                        )
+                    )
+                elif entry.seq == next_seq:
+                    cur = conn.execute(
+                        "INSERT INTO job_logs (job_id, message) VALUES (?, ?)",
+                        (entry.job_id, entry.message),
+                    )
+                    log_id = int(cur.lastrowid)
+                    conn.execute(
+                        "INSERT INTO collector_logs"
+                        " (collector, seq, log_id, job_id, message)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (collector, entry.seq, log_id, entry.job_id, entry.message),
+                    )
+                    next_seq += 1
+                    results.append(
+                        BatchEntryResult(seq=entry.seq, log_id=log_id, status="appended")
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "sequence_gap",
+                            "expected_seq": next_seq,
+                            "received_seq": entry.seq,
+                            "message": (
+                                "sequence jump would leave a gap; whole batch "
+                                "rejected, logs and progress unchanged"
+                            ),
+                        },
+                    )
+
+            conn.execute(
+                "INSERT INTO collector_states (collector, next_seq, updated_at)"
+                " VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+                " ON CONFLICT(collector) DO UPDATE SET"
+                " next_seq = excluded.next_seq, updated_at = excluded.updated_at",
+                (collector, next_seq),
+            )
+
+        appended = sum(1 for r in results if r.status == "appended")
+        return CollectorBatchReceipt(
+            collector=collector,
+            results=results,
+            appended=appended,
+            duplicated=len(results) - appended,
+            next_seq=next_seq,
+        )
+
+    @app.get(
+        "/collectors/{collector}/progress",
+        response_model=CollectorProgress,
+        tags=["collectors"],
+        summary="Show a collector's stored progress (next expected sequence)",
+    )
+    def collector_progress(
+        collector: str = PathParam(pattern=COLLECTOR_ID_PATTERN),
+    ) -> CollectorProgress:
+        with database.reader() as conn:
+            row = conn.execute(
+                "SELECT next_seq, updated_at FROM collector_states WHERE collector = ?",
+                (collector,),
+            ).fetchone()
+            if row is None:
+                raise _collector_not_found(collector)
+            stored = conn.execute(
+                "SELECT COUNT(*) AS n FROM collector_logs WHERE collector = ?",
+                (collector,),
+            ).fetchone()["n"]
+        return CollectorProgress(
+            collector=collector,
+            next_seq=int(row["next_seq"]),
+            stored=int(stored),
+            updated_at=row["updated_at"],
+        )
+
+    @app.get(
+        "/collectors/{collector}/logs",
+        response_model=CollectorLogList,
+        tags=["collectors"],
+        summary="List the stored sequence-to-log mapping of a collector",
+        description=(
+            "Sequences are contiguous from 1 with no duplicates or gaps; the duty "
+            "officer can reconcile this list against the collector's send buffer."
+        ),
+    )
+    def list_collector_logs(
+        collector: str = PathParam(pattern=COLLECTOR_ID_PATTERN),
+        after_seq: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> CollectorLogList:
+        with database.reader() as conn:
+            state = conn.execute(
+                "SELECT next_seq FROM collector_states WHERE collector = ?",
+                (collector,),
+            ).fetchone()
+            if state is None:
+                raise _collector_not_found(collector)
+            rows = conn.execute(
+                "SELECT c.seq, c.log_id, c.job_id, c.message, l.created_at"
+                " FROM collector_logs c JOIN job_logs l ON l.id = c.log_id"
+                " WHERE c.collector = ? AND c.seq > ?"
+                " ORDER BY c.seq LIMIT ?",
+                (collector, after_seq, limit),
+            ).fetchall()
+        items = [CollectorLogItem(**dict(r)) for r in rows]
+        return CollectorLogList(
+            collector=collector,
+            items=items,
+            next_after_seq=items[-1].seq if items else None,
+        )
 
     @app.post(
         "/backups",

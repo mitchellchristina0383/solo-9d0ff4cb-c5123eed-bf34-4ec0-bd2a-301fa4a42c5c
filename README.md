@@ -1,8 +1,8 @@
 # Job Log Service
 
-FastAPI + SQLite service for an append-only job log with crash-safe backup and
-verified restore.  All key flows are usable from the interactive docs at
-`/docs`.
+FastAPI + SQLite service for an append-only job log with idempotent
+per-collector batch ingestion, crash-safe backup and verified restore.  All
+key flows are usable from the interactive docs at `/docs`.
 
 ## Run
 
@@ -29,6 +29,9 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
 | ------ | ---- | ------- |
 | `POST` | `/logs` | Append a log entry; returns only after the commit is durable |
 | `GET`  | `/logs` | Query committed logs (`job_id`, `after_id`, `limit`) |
+| `POST` | `/collectors/{collector}/logs/batch` | Receive a sequenced batch from one collector; idempotent, all-or-nothing |
+| `GET`  | `/collectors/{collector}/progress` | Next expected sequence number and stored count |
+| `GET`  | `/collectors/{collector}/logs` | The stored sequence → log mapping (`after_seq`, `limit`) |
 | `POST` | `/backups` | Create, verify and publish a backup; returns its backup id |
 | `GET`  | `/backups` | List published backups |
 | `GET`  | `/backups/{id}` | Get one published backup (id, SHA-256s, snapshot row count) |
@@ -37,6 +40,42 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
 | `POST` | `/backups/{id}/restore` | Restore into an independent target (`target_name`, `overwrite`) |
 | `GET`  | `/restores/{target_name}/logs` | Read logs from a restored target (read-only) |
 | `GET`  | `/health` | Liveness/readiness |
+
+### Collector batches (`POST /collectors/{collector}/logs/batch`)
+
+Collectors （采集器） upload logs in batches where every entry carries a
+per-collector sequence number starting at 1 and increasing by 1, plus
+`job_id` and `message`:
+
+```json
+{
+  "entries": [
+    {"seq": 1, "job_id": "job-a", "message": "started"},
+    {"seq": 2, "job_id": "job-a", "message": "finished"}
+  ]
+}
+```
+
+* **Timeout retry is safe.**  If the response is lost, resend the same batch:
+  entries already stored are matched by content and acknowledged with their
+  **original log id** (`status: "duplicate"`); only the contiguous new tail is
+  appended (`status: "appended"`).  The receipt returns every entry's log id
+  and `next_seq`, the sequence number the next entry must use.
+* **Batches may overlap history.**  A batch like `[4,5,6]` right after
+  `[1..5]` acknowledges 4 and 5 with their original ids and appends only 6.
+* **All-or-nothing rejection (409).**  If the batch skips a sequence number
+  (gap, inside the batch or against the stored stream) or an old sequence
+  number arrives with different content, the whole batch is rejected and
+  neither logs nor collector progress change.  The `detail` field carries a
+  machine-readable `error` (`sequence_gap` / `content_mismatch`).
+* **Concurrency and restarts.**  The check-and-append runs in a single
+  `BEGIN IMMEDIATE` transaction, so racing batches from the same collector
+  serialise and observe each other's committed result; progress lives in the
+  same SQLite database (`synchronous=FULL`), so retries after a service
+  restart see exactly what was committed before it.
+* **Reconciliation.**  `GET /collectors/{collector}/progress` and
+  `GET /collectors/{collector}/logs` let the duty officer confirm the stored
+  stream has no duplicates or gaps against the collector's send buffer.
 
 ### Typical flow (`/docs` order)
 
@@ -51,12 +90,23 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
 
 ## Guarantees and how they are achieved
 
+* **Idempotent, gapless collector ingestion.**  Per collector, accepted
+  entries are exactly sequences `1..next_seq-1`: the mapping
+  (`collector_logs`) and the progress (`collector_states`) live in the source
+  database and are only advanced inside the same transaction that appends the
+  `job_logs` rows.  Overlapping entries are compared byte-for-byte with the
+  stored content; a match returns the original log id, a mismatch or a
+  sequence gap raises 409 and the transaction rolls back, so a rejected batch
+  changes nothing.  Concurrent batches serialise on SQLite's write lock.
 * **Consistent snapshot under concurrent appends.**  A backup opens a
   read-only connection, starts a read transaction (`BEGIN` + a `SELECT`, which
   pins one committed WAL snapshot) and copies with SQLite's online-backup API.
   Writers keep appending on `BEGIN IMMEDIATE` transactions; rows committed
   after the snapshot are excluded, rows committed before are included.  The
   copy's `COUNT(*)`/`MAX(id)` are cross-checked against the frozen snapshot.
+  Because collector progress lives in the same database, a backup always
+  pairs the logs with the exact collector progress that produced them — the
+  restored copy's `collector_states`/`collector_logs` match its `job_logs`.
 * **Backup id published only after verification.**  The copy is staged under
   `backups/.staging/`, checked with `PRAGMA integrity_check`, a
   `manifest.json` with SHA-256 digests is written, and the whole directory is
@@ -92,7 +142,12 @@ python -m pytest
 The suite covers concurrent appends during a backup, frozen-snapshot
 behaviour, immutable published backups, independent restore, corrupt-backup
 restore with the target preserved, interrupted backups after restart,
-`ready`-row demotion, backup failure, restart persistence and `/docs`.
+`ready`-row demotion, backup failure, restart persistence and `/docs`.  The
+collector batch tests cover idempotent retries, overlapping batches,
+whole-batch rejection on gaps and changed history, atomic rollback of a
+partially-valid batch, racing concurrent batches from one collector,
+retry-after-restart, and backups pairing collector progress with the logs of
+the same snapshot.
 
 ## Notes / limits
 

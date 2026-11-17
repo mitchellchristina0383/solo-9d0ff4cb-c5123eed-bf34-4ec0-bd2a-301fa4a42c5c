@@ -26,6 +26,32 @@ CREATE TABLE IF NOT EXISTS job_logs (
 );
 CREATE INDEX IF NOT EXISTS ix_job_logs_job_id ON job_logs(job_id, id);
 
+-- Ingestion progress per collector (采集器).  ``next_seq`` is the sequence
+-- number the next batch entry must continue at; entries 1..next_seq-1 are
+-- stored.  Lives in the same database as job_logs so a backup snapshot
+-- always pairs the logs with the exact progress that produced them.
+CREATE TABLE IF NOT EXISTS collector_states (
+    collector    TEXT PRIMARY KEY,
+    next_seq     INTEGER NOT NULL CHECK (next_seq >= 1),
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- One row per accepted collector entry.  job_id/message duplicate the log
+-- content so a retried batch can be checked for byte-identical content
+-- without touching job_logs; log_id points at the immutable job_logs row
+-- that was appended when the entry was first accepted.
+-- Invariant: for each collector the rows are exactly seq 1..next_seq-1,
+-- contiguous, and are only ever extended inside the same transaction that
+-- appends the job_logs rows and advances collector_states.next_seq.
+CREATE TABLE IF NOT EXISTS collector_logs (
+    collector    TEXT    NOT NULL,
+    seq          INTEGER NOT NULL CHECK (seq >= 1),
+    log_id       INTEGER NOT NULL REFERENCES job_logs(id),
+    job_id       TEXT    NOT NULL,
+    message      TEXT    NOT NULL,
+    PRIMARY KEY (collector, seq)
+);
+
 -- One row per backup attempt.  A row is only ever exposed through the API
 -- once status == 'ready'; rows in other states are implementation detail.
 CREATE TABLE IF NOT EXISTS backups (
